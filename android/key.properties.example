@@ -1,0 +1,6 @@
+# Local-only secrets — DO NOT COMMIT.
+# Used by android/app/build.gradle.kts to sign release builds.
+storeFile=/absolute/path/to/your/release.jks
+storePassword=REPLACE_ME
+keyAlias=REPLACE_ME
+keyPassword=REPLACE_ME
