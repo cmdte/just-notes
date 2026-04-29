@@ -53,7 +53,7 @@ const stickyPalette = <int>[
   0xFF37474F, // charcoal (default)
   0xFF90CAF9, // blue
   0xFFA5D6A7, // green
-  0xFFFFF59D, // yellow
+  0xFFFFCC80, // orange
   0xFFEF9A9A, // red
 ];
 
