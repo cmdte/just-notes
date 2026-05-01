@@ -60,11 +60,31 @@ class NotesRepository extends ChangeNotifier {
   DateTime? _lastSync;
   String? _lastSyncError;
 
+  // Cached sorted view of [_notes]. Recomputed lazily after mutations
+  // instead of on every getter call so the UI's frequent rebuilds stay
+  // O(1) and large vaults stay scrollable on budget devices.
+  List<Note>? _sortedCache;
+
   BackendConfig get backendConfig => _cfg;
   DateTime? get lastSync => _lastSync;
   String? get lastSyncError => _lastSyncError;
 
-  List<Note> get notes => _notes.values.toList()..sort(_orderCmp);
+  List<Note> get notes {
+    final cached = _sortedCache;
+    if (cached != null) return cached;
+    final list = _notes.values.toList()..sort(_orderCmp);
+    _sortedCache = List.unmodifiable(list);
+    return _sortedCache!;
+  }
+
+  @override
+  void notifyListeners() {
+    // Any change observable to the UI may also have changed membership or
+    // ordering, so invalidate the sorted view here in one place rather
+    // than sprinkling invalidations at every mutation site.
+    _sortedCache = null;
+    super.notifyListeners();
+  }
 
   static int _orderCmp(Note a, Note b) {
     final c = a.order.compareTo(b.order);
@@ -525,7 +545,7 @@ class NotesRepository extends ChangeNotifier {
     final to = _notes[toId];
     if (from == null || to == null) return;
 
-    final ordered = notes;
+    final ordered = notes.toList();
     ordered.removeWhere((n) => n.id == fromId);
     final targetIdx = ordered.indexWhere((n) => n.id == toId);
     if (targetIdx < 0) return;
