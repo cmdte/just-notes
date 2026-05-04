@@ -38,6 +38,38 @@ class FolderBackend implements SyncBackend {
 
   File _fileFor(String id) => File('${_dir.path}/$id.json');
 
+  static String _tagFor(FileStat stat) =>
+      '${stat.modified.microsecondsSinceEpoch}-${stat.size}';
+
+  @override
+  Future<Map<String, String>> pullManifest() async {
+    final out = <String, String>{};
+    if (!await _dir.exists()) return out;
+    await for (final entity in _dir.list(followLinks: false)) {
+      if (entity is! File) continue;
+      final name = entity.uri.pathSegments.last;
+      if (!name.endsWith('.json')) continue;
+      final id = name.substring(0, name.length - 5);
+      try {
+        out[id] = _tagFor(await entity.stat());
+      } catch (_) {/* skip */}
+    }
+    return out;
+  }
+
+  @override
+  Future<Map<String, dynamic>?> pullOne(String id) async {
+    final f = _fileFor(id);
+    if (!await f.exists()) return null;
+    try {
+      final raw = await f.readAsString();
+      if (raw.trim().isEmpty) return null;
+      return (jsonDecode(raw) as Map).cast<String, dynamic>();
+    } catch (_) {
+      return null;
+    }
+  }
+
   @override
   Future<Map<String, Map<String, dynamic>>> pullAll() async {
     final out = <String, Map<String, dynamic>>{};

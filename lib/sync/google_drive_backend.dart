@@ -117,6 +117,27 @@ class GoogleDriveBackend implements SyncBackend {
   // --- SyncBackend ---------------------------------------------------------
 
   @override
+  Future<Map<String, String>> pullManifest() async {
+    final index = await _listIndex();
+    return index.map((id, f) => MapEntry(
+          id,
+          f.modifiedTime?.toUtc().toIso8601String() ?? '',
+        ));
+  }
+
+  @override
+  Future<Map<String, dynamic>?> pullOne(String id) async {
+    final index = await _listIndex();
+    final f = index[id];
+    if (f == null) return null;
+    try {
+      return await _download(f);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
   Future<Map<String, Map<String, dynamic>>> pullAll() async {
     final index = await _listIndex();
     final out = <String, Map<String, dynamic>>{};

@@ -12,9 +12,30 @@ import 'webdav_backend.dart';
 ///
 /// All payloads handled here are already encrypted envelopes — the backend
 /// never sees plaintext. Swap implementations freely.
+///
+/// Implementations expose a manifest-driven API so the repository can do
+/// delta syncs (pull only what changed) instead of redownloading every
+/// envelope on every cycle.
 abstract class SyncBackend {
-  /// Pull every encrypted note envelope, keyed by note id.
-  Future<Map<String, Map<String, dynamic>>> pullAll();
+  /// List every id present remotely along with an opaque version tag
+  /// (ETag, modifiedTime, content hash, …). Two calls returning the same
+  /// tag for the same id mean the payload is unchanged.
+  Future<Map<String, String>> pullManifest();
+
+  /// Fetch a single envelope by id, or null if it no longer exists.
+  Future<Map<String, dynamic>?> pullOne(String id);
+
+  /// Pull every encrypted envelope. Default implementation walks the
+  /// manifest. Backends may override for one-shot bulk download.
+  Future<Map<String, Map<String, dynamic>>> pullAll() async {
+    final manifest = await pullManifest();
+    final out = <String, Map<String, dynamic>>{};
+    for (final id in manifest.keys) {
+      final env = await pullOne(id);
+      if (env != null) out[id] = env;
+    }
+    return out;
+  }
 
   /// Push (insert or overwrite) a single encrypted note.
   Future<void> push(String id, Map<String, dynamic> envelope);
@@ -77,6 +98,22 @@ class LocalStubBackend implements SyncBackend {
       _file.writeAsString(jsonEncode(data), flush: true);
 
   @override
+  Future<Map<String, String>> pullManifest() async {
+    final raw = await _read();
+    return raw.map(
+      (k, v) => MapEntry(k, _tagFor((v as Map).cast<String, dynamic>())),
+    );
+  }
+
+  @override
+  Future<Map<String, dynamic>?> pullOne(String id) async {
+    final raw = await _read();
+    final v = raw[id];
+    if (v == null) return null;
+    return (v as Map).cast<String, dynamic>();
+  }
+
+  @override
   Future<Map<String, Map<String, dynamic>>> pullAll() async {
     final raw = await _read();
     return raw.map((k, v) => MapEntry(k, (v as Map).cast<String, dynamic>()));
@@ -94,5 +131,14 @@ class LocalStubBackend implements SyncBackend {
     final data = await _read();
     data.remove(id);
     await _write(data);
+  }
+
+  /// Cheap content-derived tag. Composed from the ciphertext length and
+  /// the per-write random nonce, both of which change on every push, so
+  /// the tag changes iff the envelope changes.
+  static String _tagFor(Map<String, dynamic> envelope) {
+    final ct = envelope['ct'] as String? ?? '';
+    final nonce = envelope['nonce'] as String? ?? '';
+    return '${ct.length}-$nonce';
   }
 }

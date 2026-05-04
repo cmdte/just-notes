@@ -89,7 +89,7 @@ class WebDavBackend implements SyncBackend {
   // --- SyncBackend ---------------------------------------------------------
 
   @override
-  Future<Map<String, Map<String, dynamic>>> pullAll() async {
+  Future<Map<String, String>> pullManifest() async {
     final res = await _send('PROPFIND', _base, headers: {'Depth': '1'});
     if (res.statusCode != 207) {
       throw Exception('PROPFIND failed: ${res.statusCode}');
@@ -97,27 +97,59 @@ class WebDavBackend implements SyncBackend {
     final body = await res.stream.bytesToString();
     final doc = xml.XmlDocument.parse(body);
 
-    final ids = <String>[];
+    final out = <String, String>{};
     for (final resp in doc.findAllElements('response',
-        namespace: 'DAV:')) {
-      final href = resp.findElements('href', namespace: 'DAV:').firstOrNull;
+        namespaceUri: 'DAV:')) {
+      final href = resp.findElements('href', namespaceUri: 'DAV:').firstOrNull;
       if (href == null) continue;
       final path = Uri.decodeFull(href.innerText);
-      // We only care about the file name segment.
       final name = path.split('/').where((s) => s.isNotEmpty).lastOrNull ?? '';
       if (!name.endsWith('.json')) continue;
-      ids.add(name.substring(0, name.length - 5));
-    }
+      final id = name.substring(0, name.length - 5);
 
-    final out = <String, Map<String, dynamic>>{};
-    for (final id in ids) {
-      try {
-        final r = await _send('GET', _fileFor(id));
-        if (r.statusCode == 200) {
-          final body = await r.stream.bytesToString();
-          out[id] = jsonDecode(body) as Map<String, dynamic>;
+      // Prefer getetag; fall back to getlastmodified.
+      String? tag;
+      for (final propstat in resp.findElements('propstat', namespaceUri: 'DAV:')) {
+        final prop = propstat.findElements('prop', namespaceUri: 'DAV:').firstOrNull;
+        if (prop == null) continue;
+        final etag = prop.findElements('getetag', namespaceUri: 'DAV:').firstOrNull;
+        if (etag != null && etag.innerText.isNotEmpty) {
+          tag = etag.innerText;
+          break;
         }
-      } catch (_) {/* skip */}
+        final mtime =
+            prop.findElements('getlastmodified', namespaceUri: 'DAV:').firstOrNull;
+        if (mtime != null && mtime.innerText.isNotEmpty) {
+          tag = mtime.innerText;
+        }
+      }
+      out[id] = tag ?? '';
+    }
+    return out;
+  }
+
+  @override
+  Future<Map<String, dynamic>?> pullOne(String id) async {
+    try {
+      final r = await _send('GET', _fileFor(id));
+      if (r.statusCode == 404) return null;
+      if (r.statusCode != 200) {
+        throw Exception('GET failed: ${r.statusCode}');
+      }
+      final body = await r.stream.bytesToString();
+      return jsonDecode(body) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  Future<Map<String, Map<String, dynamic>>> pullAll() async {
+    final manifest = await pullManifest();
+    final out = <String, Map<String, dynamic>>{};
+    for (final id in manifest.keys) {
+      final env = await pullOne(id);
+      if (env != null) out[id] = env;
     }
     return out;
   }

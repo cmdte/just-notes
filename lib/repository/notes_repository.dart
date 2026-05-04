@@ -22,15 +22,15 @@ class NotesRepository extends ChangeNotifier {
     this._backend,
     this._cacheFile,
     this._tombstonesFile,
+    this._tagsFile,
+    this._dirtyFile,
     this._cfg,
   );
 
-  static const _saltStorageKey = 'vault_salt_b64';
-  static const _verifierStorageKey = 'vault_verifier';
+  static const _descriptorStorageKey = 'vault_descriptor_json';
   static const _rememberedPassKey = 'vault_pass_remembered';
   static const _backendCfgKey = 'backend_config_json';
   static const _lastSyncKey = 'vault_last_sync_iso';
-  static const _verifierPlaintext = 'sticky-notes-vault-ok';
   static const _vaultDescriptorId = '__vault__';
   static const _tombstonesDocId = '__tombstones__';
 
@@ -49,10 +49,19 @@ class NotesRepository extends ChangeNotifier {
   BackendConfig _cfg;
   final File _cacheFile;
   final File _tombstonesFile;
+  final File _tagsFile;
+  final File _dirtyFile;
   final _uuid = const Uuid();
 
   final Map<String, Note> _notes = <String, Note>{};
   final Map<String, DateTime> _tombstones = <String, DateTime>{};
+  /// Last-known opaque version tag per remote id. Drives delta sync —
+  /// only ids whose tag changed between syncs are re-downloaded.
+  final Map<String, String> _remoteTags = <String, String>{};
+  /// Notes that have local edits not yet acknowledged by the backend.
+  /// Persisted so offline edits survive a restart and get pushed on the
+  /// next successful sync.
+  final Set<String> _dirty = <String>{};
   Timer? _autoSyncTimer;
   Timer? _cacheWriteTimer;
   Future<void>? _cacheWriteInFlight;
@@ -103,7 +112,7 @@ class NotesRepository extends ChangeNotifier {
 
   /// True if the vault has been initialized at least once on this device.
   static Future<bool> isInitialized() async =>
-      (await _storage.read(key: _saltStorageKey)) != null;
+      (await _storage.read(key: _descriptorStorageKey)) != null;
 
   /// Try to auto-unlock using a passphrase saved on this device.
   /// Returns null if no remembered passphrase exists.
@@ -128,62 +137,55 @@ class NotesRepository extends ChangeNotifier {
     final cfgRaw = await _storage.read(key: _backendCfgKey);
     final cfg = BackendConfig.fromJsonString(cfgRaw);
 
-    // Try to connect to the configured backend up-front so we can adopt a
-    // vault descriptor (salt + verifier) that was published by another
+    // Try to connect to the configured backend up-front so we can adopt
+    // the vault descriptor (salt + wrapped DEK) published by another
     // device. If the backend is unavailable (offline, sign-in cancelled),
-    // we fall back to the local stub and use the device-local salt.
+    // fall back to the local stub and use whatever descriptor we already
+    // have on disk.
     SyncBackend? backend;
-    Map<String, dynamic>? cloudVault;
-    Map<String, Map<String, dynamic>>? remoteSnapshot;
+    VaultDescriptor? descriptor;
+    var backendReachable = false;
     if (cfg.kind != BackendKind.stub) {
       backend = await buildBackend(cfg);
       if (backend != null) {
         try {
-          remoteSnapshot = await backend.pullAll();
-          cloudVault = remoteSnapshot.remove(_vaultDescriptorId);
+          descriptor =
+              VaultDescriptor.fromJson(await backend.pullOne(_vaultDescriptorId));
+          backendReachable = true;
         } catch (_) {/* offline tolerated */}
       }
     }
 
-    String? salt;
-    Map<String, dynamic>? verifier;
-    if (cloudVault != null) {
-      salt = cloudVault['salt'] as String?;
-      final v = cloudVault['verifier'];
-      if (v is Map) verifier = v.cast<String, dynamic>();
-    } else {
-      salt = await _storage.read(key: _saltStorageKey);
-      final vRaw = await _storage.read(key: _verifierStorageKey);
-      if (vRaw != null) {
-        verifier = jsonDecode(vRaw) as Map<String, dynamic>;
+    if (descriptor == null) {
+      final localRaw = await _storage.read(key: _descriptorStorageKey);
+      if (localRaw != null) {
+        descriptor = VaultDescriptor.fromJson(
+          jsonDecode(localRaw) as Map<String, dynamic>,
+        );
       }
     }
 
-    final crypto = await NoteCrypto.derive(
-      passphrase: passphrase,
-      saltB64: salt,
-    );
-
-    if (verifier == null) {
-      // First-time setup (this device, no cloud descriptor).
-      verifier = await crypto.encryptJson({'check': _verifierPlaintext});
+    NoteCrypto crypto;
+    var freshlyCreated = false;
+    if (descriptor == null) {
+      // First-time setup on this device with no cloud descriptor: mint a
+      // brand-new vault.
+      final created = await Vault.create(passphrase);
+      crypto = created.crypto;
+      descriptor = created.descriptor;
+      freshlyCreated = true;
     } else {
-      try {
-        final clear = await crypto.decryptJson(verifier);
-        if (clear['check'] != _verifierPlaintext) {
-          return (repo: null, error: 'Incorrect passphrase.');
-        }
-      } catch (_) {
+      final opened = await Vault.open(passphrase, descriptor);
+      if (opened == null) {
         return (repo: null, error: 'Incorrect passphrase.');
       }
+      crypto = opened;
     }
 
-    // Persist (or refresh) salt + verifier locally so future unlocks are
-    // fast even if the backend is offline.
-    await _storage.write(key: _saltStorageKey, value: crypto.saltB64);
+    // Persist the descriptor locally so future unlocks succeed offline.
     await _storage.write(
-      key: _verifierStorageKey,
-      value: jsonEncode(verifier),
+      key: _descriptorStorageKey,
+      value: jsonEncode(descriptor.toJson()),
     );
 
     if (remember) {
@@ -194,14 +196,10 @@ class NotesRepository extends ChangeNotifier {
 
     backend ??= await buildBackend(cfg) ?? await LocalStubBackend.create();
 
-    // Publish the vault descriptor if the cloud doesn't have one yet (so
-    // the second device can adopt it on its next unlock).
-    if (cfg.kind != BackendKind.stub && cloudVault == null) {
+    // Publish the descriptor if this device just minted one.
+    if (cfg.kind != BackendKind.stub && freshlyCreated && backendReachable) {
       try {
-        await backend.push(_vaultDescriptorId, <String, dynamic>{
-          'salt': crypto.saltB64,
-          'verifier': verifier,
-        });
+        await backend.push(_vaultDescriptorId, descriptor.toJson());
       } catch (_) {/* offline tolerated */}
     }
 
@@ -210,39 +208,35 @@ class NotesRepository extends ChangeNotifier {
     if (!await cacheFile.exists()) await cacheFile.writeAsString('{}');
     final tombstonesFile = File('${dir.path}/tombstones.json');
     if (!await tombstonesFile.exists()) await tombstonesFile.writeAsString('{}');
+    final tagsFile = File('${dir.path}/remote_tags.json');
+    if (!await tagsFile.exists()) await tagsFile.writeAsString('{}');
+    final dirtyFile = File('${dir.path}/dirty_ids.json');
+    if (!await dirtyFile.exists()) await dirtyFile.writeAsString('[]');
 
     final repo = NotesRepository._(
       crypto,
       backend,
       cacheFile,
       tombstonesFile,
+      tagsFile,
+      dirtyFile,
       cfg,
     );
     await repo._loadTombstones();
     await repo._loadFromCache();
     await repo._loadLastSync();
-    // If we already pulled the remote snapshot above, apply it now so the
-    // user sees other devices' notes immediately on first launch — and so
-    // notes deleted on other devices are gone *before* the UI ever sees
-    // them (no "ghost" flicker).
-    if (remoteSnapshot != null) {
-      remoteSnapshot.remove(_vaultDescriptorId);
-      remoteSnapshot.remove(_tombstonesDocId);
-      // Reuse the same deletion-detection used by sync().
-      repo._reconcileDeletionsAgainst(remoteSnapshot);
-      await repo._applyRemote(remoteSnapshot);
-      await repo._writeCache();
-      await repo._writeTombstones();
-      // Pretend we just synced so the UI shows a sensible timestamp and
-      // the deletion-detection baseline advances.
-      repo._lastSync = DateTime.now();
-      await _storage.write(
-        key: _lastSyncKey,
-        value: repo._lastSync!.toIso8601String(),
-      );
+    await repo._loadRemoteTags();
+    await repo._loadDirty();
+
+    // If the backend was reachable, run a delta sync now so the user sees
+    // other devices' notes immediately on first frame (and so notes
+    // deleted on other devices vanish before the UI ever renders them).
+    // If unreachable or stub-only, skip — UI shows the local cache.
+    if (backendReachable) {
+      await repo.sync();
+    } else {
+      unawaited(repo.sync());
     }
-    // Fire-and-forget a follow-up sync (push anything local-only).
-    unawaited(repo.sync());
     return (repo: repo, error: null);
   }
 
@@ -250,9 +244,8 @@ class NotesRepository extends ChangeNotifier {
 
   /// Persist a new backend config and reconnect.
   /// If the new backend already holds a vault descriptor (because another
-  /// device pushed it), adopt that descriptor: re-derive the key from the
-  /// remembered passphrase + cloud salt and re-encrypt the local cache so
-  /// future writes are decryptable on every device.
+  /// device pushed it), adopt that descriptor: unwrap its DEK with the
+  /// remembered passphrase so notes on the new backend become readable.
   Future<({bool ok, String? error})> setBackend(BackendConfig cfg) async {
     await _storage.write(key: _backendCfgKey, value: cfg.toJsonString());
     final newBackend = await buildBackend(cfg);
@@ -264,86 +257,60 @@ class NotesRepository extends ChangeNotifier {
 
     if (cfg.kind != BackendKind.stub) {
       try {
-        final remote = await newBackend.pullAll();
-        final cloudVault = remote.remove(_vaultDescriptorId);
-        if (cloudVault != null) {
-          final cloudSalt = cloudVault['salt'] as String?;
-          final v = cloudVault['verifier'];
-          final cloudVerifier = v is Map ? v.cast<String, dynamic>() : null;
-          if (cloudSalt != null &&
-              cloudVerifier != null &&
-              cloudSalt != _crypto.saltB64) {
-            // Cloud uses a different vault. Re-derive with the remembered
-            // passphrase, validate, then re-encrypt the local cache so we
-            // can read what other devices have written.
-            final pass = await _storage.read(key: _rememberedPassKey);
-            if (pass == null) {
-              return (
-                ok: false,
-                error: 'Re-enter passphrase to switch vaults.',
-              );
-            }
-            final newCrypto = await NoteCrypto.derive(
-              passphrase: pass,
-              saltB64: cloudSalt,
-            );
-            try {
-              final clear = await newCrypto.decryptJson(cloudVerifier);
-              if (clear['check'] != _verifierPlaintext) {
-                return (
-                  ok: false,
-                  error: 'Cloud vault has a different passphrase.',
-                );
-              }
-            } catch (_) {
-              return (
-                ok: false,
-                error: 'Cloud vault has a different passphrase.',
-              );
-            }
-            _crypto = newCrypto;
-            await _storage.write(
-              key: _saltStorageKey,
-              value: newCrypto.saltB64,
-            );
-            await _storage.write(
-              key: _verifierStorageKey,
-              value: jsonEncode(cloudVerifier),
+        // Switching backends invalidates any cached delta-sync state from
+        // the previous backend.
+        _remoteTags.clear();
+        await _writeRemoteTags();
+
+        final cloudDescriptor = VaultDescriptor.fromJson(
+          await newBackend.pullOne(_vaultDescriptorId),
+        );
+
+        if (cloudDescriptor != null) {
+          // Cloud already has a vault. Try to unwrap its DEK with the
+          // remembered passphrase. If we don't have one cached, the user
+          // must re-enter it via the unlock flow.
+          final pass = await _storage.read(key: _rememberedPassKey);
+          if (pass == null) {
+            return (
+              ok: false,
+              error: 'Re-enter passphrase to switch vaults.',
             );
           }
+          final adopted = await Vault.open(pass, cloudDescriptor);
+          if (adopted == null) {
+            return (
+              ok: false,
+              error: 'Cloud vault has a different passphrase.',
+            );
+          }
+          _crypto = adopted;
+          await _storage.write(
+            key: _descriptorStorageKey,
+            value: jsonEncode(cloudDescriptor.toJson()),
+          );
         }
+
         _backend = newBackend;
         _cfg = cfg;
 
-        // Push the descriptor if the cloud doesn't have one.
-        if (cloudVault == null) {
-          final localVerifierRaw =
-              await _storage.read(key: _verifierStorageKey);
-          if (localVerifierRaw != null) {
-            try {
-              await _backend.push(_vaultDescriptorId, <String, dynamic>{
-                'salt': _crypto.saltB64,
-                'verifier': jsonDecode(localVerifierRaw),
-              });
-            } catch (_) {/* offline tolerated */}
-          }
-        }
-
-        // Apply the remote notes we already pulled, then re-write the
-        // cache (now encrypted with whatever key we settled on).
-        await _applyRemote(remote);
-        await _writeCache();
-        // Push anything local-only with the (possibly new) key.
-        for (final n in _notes.values) {
-          if (!remote.containsKey(n.id)) {
+        // Push our descriptor if the cloud doesn't have one.
+        if (cloudDescriptor == null) {
+          final localRaw = await _storage.read(key: _descriptorStorageKey);
+          if (localRaw != null) {
             try {
               await _backend.push(
-                n.id,
-                await _crypto.encryptJson(n.toPlainJson()),
+                _vaultDescriptorId,
+                jsonDecode(localRaw) as Map<String, dynamic>,
               );
             } catch (_) {/* offline tolerated */}
           }
         }
+
+        // Mark every local note dirty so the next sync pushes them all
+        // up to the new backend.
+        _dirty.addAll(_notes.keys);
+        await _writeDirty();
       } catch (e) {
         notifyListeners();
         return (ok: false, error: 'Sync failed: $e');
@@ -366,10 +333,12 @@ class NotesRepository extends ChangeNotifier {
 
   // --- passphrase change --------------------------------------------------
 
-  /// Change the vault passphrase. Verifies [oldPass], derives a fresh key
-  /// from [newPass] (with a brand-new salt), then re-encrypts every note
-  /// and the tombstone blob on the configured backend before publishing
-  /// the new vault descriptor. Local secure storage is updated last.
+  /// Change the vault passphrase.
+  ///
+  /// Thanks to envelope encryption (DEK/KEK), this is an atomic O(1)
+  /// operation: the DEK is unchanged, only the small wrapped-DEK
+  /// descriptor is re-keyed and re-published. Notes are never touched, so
+  /// a network drop mid-operation cannot corrupt the vault.
   ///
   /// Returns null on success, or a user-facing error message.
   Future<String?> changePassphrase({
@@ -378,67 +347,34 @@ class NotesRepository extends ChangeNotifier {
   }) async {
     if (newPass.isEmpty) return 'New passphrase cannot be empty.';
 
-    // 1. Verify the old passphrase against the stored verifier.
-    final storedVerifierRaw = await _storage.read(key: _verifierStorageKey);
-    if (storedVerifierRaw == null) {
-      return 'Vault is not initialized.';
-    }
-    final storedVerifier =
-        jsonDecode(storedVerifierRaw) as Map<String, dynamic>;
-    final oldCrypto = await NoteCrypto.derive(
-      passphrase: oldPass,
-      saltB64: _crypto.saltB64,
+    // 1. Verify the old passphrase by re-opening the current descriptor.
+    final storedRaw = await _storage.read(key: _descriptorStorageKey);
+    if (storedRaw == null) return 'Vault is not initialized.';
+    final current = VaultDescriptor.fromJson(
+      jsonDecode(storedRaw) as Map<String, dynamic>,
     );
-    try {
-      final clear = await oldCrypto.decryptJson(storedVerifier);
-      if (clear['check'] != _verifierPlaintext) {
-        return 'Current passphrase is incorrect.';
-      }
-    } catch (_) {
+    if (current == null) return 'Vault descriptor is corrupt.';
+    if (await Vault.open(oldPass, current) == null) {
       return 'Current passphrase is incorrect.';
     }
 
-    // 2. Derive a new key with a brand-new salt and build the new verifier.
-    final newCrypto = await NoteCrypto.derive(passphrase: newPass);
-    final newVerifier =
-        await newCrypto.encryptJson({'check': _verifierPlaintext});
+    // 2. Re-wrap the existing DEK with a KEK derived from the new
+    //    passphrase + a fresh salt.
+    final newDescriptor = await Vault.rewrap(_crypto, newPass);
 
-    // 3. Re-encrypt and push every note with the new key. We push *before*
-    //    swapping the descriptor so other devices that pick up the new
-    //    descriptor will find decryptable note blobs already in place.
+    // 3. Publish the new descriptor (atomic from the cloud's POV).
     if (_cfg.kind != BackendKind.stub) {
       try {
-        for (final n in _notes.values) {
-          await _backend.push(
-            n.id,
-            await newCrypto.encryptJson(n.toPlainJson()),
-          );
-        }
-        // Re-encrypt tombstones blob too.
-        final tombPayload = <String, String>{
-          for (final e in _tombstones.entries)
-            e.key: e.value.toIso8601String(),
-        };
-        await _backend.push(
-          _tombstonesDocId,
-          await newCrypto.encryptJson({'t': tombPayload}),
-        );
-        // 4. Publish the new descriptor (atomic swap from the cloud's POV).
-        await _backend.push(_vaultDescriptorId, <String, dynamic>{
-          'salt': newCrypto.saltB64,
-          'verifier': newVerifier,
-        });
+        await _backend.push(_vaultDescriptorId, newDescriptor.toJson());
       } catch (e) {
-        return 'Could not push re-encrypted vault: $e';
+        return 'Could not publish new descriptor: $e';
       }
     }
 
-    // 5. Swap in the new key locally and persist new salt + verifier.
-    _crypto = newCrypto;
-    await _storage.write(key: _saltStorageKey, value: newCrypto.saltB64);
+    // 4. Persist the new descriptor locally.
     await _storage.write(
-      key: _verifierStorageKey,
-      value: jsonEncode(newVerifier),
+      key: _descriptorStorageKey,
+      value: jsonEncode(newDescriptor.toJson()),
     );
 
     // If a passphrase was remembered for auto-unlock, update it.
@@ -501,6 +437,36 @@ class NotesRepository extends ChangeNotifier {
     await _tombstonesFile.writeAsString(jsonEncode(out), flush: true);
   }
 
+  Future<void> _loadRemoteTags() async {
+    try {
+      final raw = await _tagsFile.readAsString();
+      if (raw.trim().isEmpty) return;
+      final data = jsonDecode(raw) as Map<String, dynamic>;
+      _remoteTags
+        ..clear()
+        ..addAll(data.map((k, v) => MapEntry(k, v as String)));
+    } catch (_) {/* ignore */}
+  }
+
+  Future<void> _writeRemoteTags() async {
+    await _tagsFile.writeAsString(jsonEncode(_remoteTags), flush: true);
+  }
+
+  Future<void> _loadDirty() async {
+    try {
+      final raw = await _dirtyFile.readAsString();
+      if (raw.trim().isEmpty) return;
+      final list = (jsonDecode(raw) as List).cast<String>();
+      _dirty
+        ..clear()
+        ..addAll(list);
+    } catch (_) {/* ignore */}
+  }
+
+  Future<void> _writeDirty() async {
+    await _dirtyFile.writeAsString(jsonEncode(_dirty.toList()), flush: true);
+  }
+
   /// Encrypt and push the merged tombstone map to the cloud so other
   /// devices can apply the deletions on their next sync.
   Future<void> _pushTombstones() async {
@@ -530,6 +496,7 @@ class NotesRepository extends ChangeNotifier {
       order: minOrder - 1,
     );
     _notes[note.id] = note;
+    _markDirty(note.id);
     notifyListeners();
     // Don't block the UI on disk + network; run persistence in the
     // background so the editor opens immediately.
@@ -542,33 +509,40 @@ class NotesRepository extends ChangeNotifier {
   Future<void> reorder(String fromId, String toId) async {
     if (fromId == toId) return;
     final from = _notes[fromId];
-    final to = _notes[toId];
-    if (from == null || to == null) return;
+    if (from == null || !_notes.containsKey(toId)) return;
 
     final ordered = notes.toList();
     ordered.removeWhere((n) => n.id == fromId);
     final targetIdx = ordered.indexWhere((n) => n.id == toId);
     if (targetIdx < 0) return;
-    ordered.insert(targetIdx, from);
 
-    // Reassign dense, integer order values so future inserts stay simple.
-    for (var i = 0; i < ordered.length; i++) {
-      ordered[i].order = i.toDouble();
+    // Use fractional midpoint ordering so only the moved note gets
+    // mutated and pushed. Re-densifying the entire list forces O(N)
+    // sequential network pushes on every single drag-and-drop.
+    //
+    // Semantics: `from` lands immediately before `to`, i.e. between
+    // `ordered[targetIdx - 1]` and `ordered[targetIdx]` (= `to`).
+    final double newOrder;
+    if (targetIdx == 0) {
+      newOrder = ordered.first.order - 1.0;
+    } else {
+      newOrder =
+          (ordered[targetIdx - 1].order + ordered[targetIdx].order) / 2.0;
     }
+
+    from.order = newOrder;
+    from.updatedAt = DateTime.now();
+
+    _markDirty(from.id);
     notifyListeners();
-    _scheduleCacheWrite();
-    // Push every changed note (cheap for typical sticky-note counts).
-    for (final n in ordered) {
-      try {
-        await _backend.push(n.id, await _crypto.encryptJson(n.toPlainJson()));
-      } catch (_) {/* offline tolerated */}
-    }
-    _scheduleAutoSync();
+    // Don't block the UI on disk + network.
+    unawaited(_persist(from));
   }
 
   Future<void> update(Note note) async {
     note.updatedAt = DateTime.now();
     _notes[note.id] = note;
+    _markDirty(note.id);
     notifyListeners();
     // Don't block the UI on disk + network.
     unawaited(_persist(note));
@@ -577,9 +551,12 @@ class NotesRepository extends ChangeNotifier {
   Future<void> delete(String id) async {
     _notes.remove(id);
     _tombstones[id] = DateTime.now();
+    _clearDirty(id);
+    _remoteTags.remove(id);
     notifyListeners();
     _scheduleCacheWrite();
     unawaited(_writeTombstones());
+    unawaited(_writeRemoteTags());
     unawaited(() async {
       try {
         await _backend.delete(id);
@@ -594,8 +571,18 @@ class NotesRepository extends ChangeNotifier {
     try {
       final envelope = await _crypto.encryptJson(note.toPlainJson());
       await _backend.push(note.id, envelope);
-    } catch (_) {/* offline tolerated */}
+      _clearDirty(note.id);
+    } catch (_) {/* offline tolerated, retried via _dirty */}
     _scheduleAutoSync();
+  }
+
+  void _markDirty(String id) {
+    _dirty.add(id);
+    unawaited(_writeDirty());
+  }
+
+  void _clearDirty(String id) {
+    if (_dirty.remove(id)) unawaited(_writeDirty());
   }
 
   /// Coalesce rapid edits into a single full-cache rewrite. The cache is
@@ -633,26 +620,31 @@ class NotesRepository extends ChangeNotifier {
     _lastSyncError = null;
     notifyListeners();
     try {
-      final remote = await _backend.pullAll();
-      remote.remove(_vaultDescriptorId);
+      // 1. Cheap "what's out there?" call — no payloads.
+      final manifest = await _backend.pullManifest();
 
-      // Merge cloud tombstones into local tombstones (max timestamp wins).
-      final remoteTombsEnv = remote.remove(_tombstonesDocId);
+      // 2. Tombstones blob: re-pull only when its tag changed.
       var tombstonesChanged = false;
-      if (remoteTombsEnv != null) {
-        try {
-          final clear = await _crypto.decryptJson(remoteTombsEnv);
-          final raw = (clear['t'] as Map?)?.cast<String, dynamic>() ?? {};
-          for (final e in raw.entries) {
-            final ts = DateTime.tryParse(e.value as String);
-            if (ts == null) continue;
-            final existing = _tombstones[e.key];
-            if (existing == null || ts.isAfter(existing)) {
-              _tombstones[e.key] = ts;
-              tombstonesChanged = true;
+      final remoteTombsTag = manifest[_tombstonesDocId];
+      if (remoteTombsTag != null &&
+          _remoteTags[_tombstonesDocId] != remoteTombsTag) {
+        final remoteTombsEnv = await _backend.pullOne(_tombstonesDocId);
+        if (remoteTombsEnv != null) {
+          try {
+            final clear = await _crypto.decryptJson(remoteTombsEnv);
+            final raw = (clear['t'] as Map?)?.cast<String, dynamic>() ?? {};
+            for (final e in raw.entries) {
+              final ts = DateTime.tryParse(e.value as String);
+              if (ts == null) continue;
+              final existing = _tombstones[e.key];
+              if (existing == null || ts.isAfter(existing)) {
+                _tombstones[e.key] = ts;
+                tombstonesChanged = true;
+              }
             }
-          }
-        } catch (_) {/* skip */}
+            _remoteTags[_tombstonesDocId] = remoteTombsTag;
+          } catch (_) {/* skip */}
+        }
       }
 
       // Prune very old tombstones.
@@ -671,45 +663,76 @@ class NotesRepository extends ChangeNotifier {
         final n = _notes[entry.key];
         if (n != null && !n.updatedAt.isAfter(entry.value)) {
           _notes.remove(entry.key);
+          _clearDirty(entry.key);
         }
       }
-      // ...and skip resurrecting tombstoned notes from the remote snapshot.
-      remote.removeWhere((id, env) {
-        final ts = _tombstones[id];
-        return ts != null;
-      });
 
-      if (_reconcileDeletionsAgainst(remote)) {
+      // 3. Build the set of "real" remote ids (filter out our control docs)
+      //    and detect deletions that came in without a tombstone.
+      final remoteNoteIds = manifest.keys
+          .where((id) => id != _vaultDescriptorId && id != _tombstonesDocId)
+          .toSet();
+      // Tombstoned ids should not be resurrected even if the cloud blob
+      // still happens to exist.
+      remoteNoteIds.removeWhere((id) => _tombstones.containsKey(id));
+
+      if (_reconcileDeletionsAgainst(remoteNoteIds)) {
         tombstonesChanged = true;
       }
 
-      await _applyRemote(remote);
+      // 4. Pull only what changed since last sync.
+      final toPull = <String>[
+        for (final id in remoteNoteIds)
+          if (_remoteTags[id] != manifest[id]) id,
+      ];
+      final pulled = <String, Map<String, dynamic>>{};
+      for (final id in toPull) {
+        final env = await _backend.pullOne(id);
+        if (env != null) pulled[id] = env;
+      }
+      await _applyRemote(pulled);
+      // Update the tag cache for everything we just pulled.
+      for (final id in pulled.keys) {
+        final tag = manifest[id];
+        if (tag != null) _remoteTags[id] = tag;
+      }
+      // Drop tag entries for ids that no longer exist remotely.
+      _remoteTags.removeWhere(
+        (id, _) =>
+            id != _tombstonesDocId &&
+            id != _vaultDescriptorId &&
+            !manifest.containsKey(id),
+      );
 
-      // Push anything local that the remote doesn't have, or that the
-      // remote has an older version of. Skip notes that are tombstoned
-      // newer than the local edit.
-      for (final n in _notes.values) {
-        final ts = _tombstones[n.id];
-        if (ts != null) continue;
-        final r = remote[n.id];
-        var shouldPush = r == null;
-        if (r != null) {
-          // Remote exists; push only if our local copy is strictly newer.
-          final clear = await _crypto.decryptJson(r);
-          final remoteNote = Note.fromPlainJson(n.id, clear);
-          if (n.updatedAt.isAfter(remoteNote.updatedAt)) {
-            shouldPush = true;
-          }
+      // 5. Push every dirty note (notes with unflushed local edits) plus
+      //    any local note the cloud doesn't have yet.
+      final toPush = <String>{
+        ..._dirty,
+        for (final id in _notes.keys)
+          if (!manifest.containsKey(id)) id,
+      };
+      for (final id in toPush) {
+        final n = _notes[id];
+        if (n == null) {
+          _clearDirty(id);
+          continue;
         }
-        if (shouldPush) {
-          await _backend.push(n.id, await _crypto.encryptJson(n.toPlainJson()));
-        }
+        if (_tombstones.containsKey(id)) continue;
+        try {
+          await _backend.push(id, await _crypto.encryptJson(n.toPlainJson()));
+          _clearDirty(id);
+          // Tag is unknown until next manifest pull; leave it absent so the
+          // next sync re-fetches the canonical tag (one extra pull per
+          // changed note — still much cheaper than full sync).
+          _remoteTags.remove(id);
+        } catch (_) {/* offline tolerated; stays dirty */}
       }
 
       if (tombstonesChanged) {
         await _writeTombstones();
         await _pushTombstones();
       }
+      await _writeRemoteTags();
       await _writeCache();
       _lastSync = DateTime.now();
       await _storage.write(
@@ -727,33 +750,34 @@ class NotesRepository extends ChangeNotifier {
   /// Detect notes that were deleted on another device WITHOUT leaving a
   /// tombstone (e.g. the tombstone blob was pruned past the TTL).
   /// If we've completed at least one sync before, any local note that
-  /// existed at that time and is now absent from the remote snapshot has
+  /// existed at that time and is now absent from the remote manifest has
   /// been deleted elsewhere. Returns true if any tombstone was created.
   ///
-  /// Safety net: if the remote snapshot contains *none* of our pre-existing
+  /// Safety net: if the remote manifest contains *none* of our pre-existing
   /// notes (wrong account, Drive folder wiped, partial pull), refuse to
   /// auto-tombstone — that path would mass-delete the user's data.
-  bool _reconcileDeletionsAgainst(Map<String, Map<String, dynamic>> remote) {
+  bool _reconcileDeletionsAgainst(Set<String> remoteIds) {
     final lastSync = _lastSync;
     if (lastSync == null) return false;
     final preExisting = _notes.values
         .where((n) => !n.updatedAt.isAfter(lastSync))
         .toList();
     if (preExisting.isEmpty) return false;
-    final overlap = preExisting.where((n) => remote.containsKey(n.id)).length;
+    final overlap = preExisting.where((n) => remoteIds.contains(n.id)).length;
     if (overlap == 0) {
-      // Snapshot doesn't look like ours; do nothing rather than wipe data.
+      // Manifest doesn't look like ours; do nothing rather than wipe data.
       return false;
     }
     final missing = <String>[
       for (final n in preExisting)
-        if (!remote.containsKey(n.id)) n.id,
+        if (!remoteIds.contains(n.id)) n.id,
     ];
     if (missing.isEmpty) return false;
     final now = DateTime.now();
     for (final id in missing) {
       _notes.remove(id);
       _tombstones[id] = now;
+      _clearDirty(id);
     }
     return true;
   }
@@ -768,6 +792,7 @@ class NotesRepository extends ChangeNotifier {
         final local = _notes[entry.key];
         if (local == null || remoteNote.updatedAt.isAfter(local.updatedAt)) {
           _notes[entry.key] = remoteNote;
+          _clearDirty(entry.key);
         }
       } catch (_) {/* skip */}
     }
