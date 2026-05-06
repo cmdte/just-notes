@@ -672,9 +672,14 @@ class NotesRepository extends ChangeNotifier {
                 tombstonesChanged = true;
               }
             }
+            if (_tombstones.keys.any((id) => !raw.containsKey(id))) {
+              tombstonesChanged = true;
+            }
             _remoteTags[_tombstonesDocId] = remoteTombsTag;
           } catch (_) {/* skip */}
         }
+      } else if (remoteTombsTag == null && _tombstones.isNotEmpty) {
+        tombstonesChanged = true;
       }
 
       // Prune very old tombstones.
@@ -703,8 +708,16 @@ class NotesRepository extends ChangeNotifier {
           .where((id) => id != _vaultDescriptorId && id != _tombstonesDocId)
           .toSet();
       // Tombstoned ids should not be resurrected even if the cloud blob
-      // still happens to exist.
-      remoteNoteIds.removeWhere((id) => _tombstones.containsKey(id));
+      // still happens to exist. This means we deleted it while offline.
+      // We should delete the orphaned note file and re-push our tombstones.
+      final garbageIds = remoteNoteIds.where((id) => _tombstones.containsKey(id)).toList();
+      for (final id in garbageIds) {
+        try {
+          await _backend.delete(id);
+        } catch (_) {}
+        remoteNoteIds.remove(id);
+        tombstonesChanged = true;
+      }
 
       if (_reconcileDeletionsAgainst(remoteNoteIds)) {
         tombstonesChanged = true;
