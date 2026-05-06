@@ -27,6 +27,7 @@ class BoardScreen extends StatelessWidget {
           appBar: AppBar(
             title: const Text('Just Notes'),
             actions: [
+              _SyncButton(repo: repo),
               IconButton(
                 tooltip: 'Settings',
                 icon: const Icon(Icons.settings_outlined),
@@ -90,6 +91,57 @@ class BoardScreen extends StatelessWidget {
     if (w >= 900) return 4;
     if (w >= 600) return 3;
     return 2;
+  }
+}
+
+class _SyncButton extends StatefulWidget {
+  const _SyncButton({required this.repo});
+  final NotesRepository repo;
+
+  @override
+  State<_SyncButton> createState() => _SyncButtonState();
+}
+
+class _SyncButtonState extends State<_SyncButton>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _spin = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 800),
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    widget.repo.addListener(_update);
+    if (widget.repo.syncing) _spin.repeat();
+  }
+
+  void _update() {
+    if (widget.repo.syncing) {
+      if (!_spin.isAnimating) _spin.repeat();
+    } else {
+      _spin.stop();
+      _spin.reset();
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.repo.removeListener(_update);
+    _spin.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return RotationTransition(
+      turns: _spin,
+      child: IconButton(
+        tooltip: 'Sync now',
+        icon: const Icon(Icons.sync),
+        onPressed: widget.repo.syncing ? null : widget.repo.sync,
+      ),
+    );
   }
 }
 
