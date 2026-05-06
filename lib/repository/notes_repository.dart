@@ -529,6 +529,40 @@ class NotesRepository extends ChangeNotifier {
     unawaited(_persist(from));
   }
 
+  /// Move [fromId] to the given [targetIndex] in the sorted list.
+  /// Used for live drag-to-reorder.
+  Future<void> reorderToIndex(String fromId, int targetIndex) async {
+    final from = _notes[fromId];
+    if (from == null) return;
+
+    final ordered = notes.toList();
+    final currentIdx = ordered.indexWhere((n) => n.id == fromId);
+    if (currentIdx < 0 || currentIdx == targetIndex) return;
+
+    ordered.removeAt(currentIdx);
+    final insertIdx = targetIndex.clamp(0, ordered.length);
+
+    final double newOrder;
+    if (ordered.isEmpty) {
+      newOrder = 0.0;
+    } else if (insertIdx == 0) {
+      newOrder = ordered.first.order - 1.0;
+    } else if (insertIdx >= ordered.length) {
+      newOrder = ordered.last.order + 1.0;
+    } else {
+      newOrder =
+          (ordered[insertIdx - 1].order + ordered[insertIdx].order) / 2.0;
+    }
+
+    from.order = newOrder;
+    from.updatedAt = DateTime.now();
+
+    _markDirty(from.id);
+    notifyListeners();
+    // Don't block the UI on disk + network.
+    unawaited(_persist(from));
+  }
+
   Future<void> update(Note note) async {
     note.updatedAt = DateTime.now();
     _notes[note.id] = note;

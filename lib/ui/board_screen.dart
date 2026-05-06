@@ -52,25 +52,7 @@ class BoardScreen extends StatelessWidget {
                       _EmptyState(),
                     ],
                   )
-                : Padding(
-                    padding: const EdgeInsets.all(8),
-                    child: MasonryGridView.count(
-                      // Force a full relayout when note order changes.
-                      // MasonryGridView caches column heights by item key,
-                      // which causes gaps when items swap positions.
-                      key: ValueKey(notes.map((n) => n.id).join(',')),
-                      physics: const AlwaysScrollableScrollPhysics(),
-                      crossAxisCount: _columnsFor(context),
-                      mainAxisSpacing: 8,
-                      crossAxisSpacing: 8,
-                      itemCount: notes.length,
-                      itemBuilder: (context, i) => _DraggableSticky(
-                        key: ValueKey(notes[i].id),
-                        note: notes[i],
-                        repo: repo,
-                      ),
-                    ),
-                  ),
+                : _ReorderableBoard(repo: repo),
           ),
           floatingActionButton: FloatingActionButton(
             onPressed: () async {
@@ -95,6 +77,91 @@ class BoardScreen extends StatelessWidget {
     if (w >= 900) return 4;
     if (w >= 600) return 3;
     return 2;
+  }
+}
+
+/// Board widget that supports Google Keep-style drag-to-reorder.
+/// Notes smoothly rearrange as you drag, showing the live insertion point.
+class _ReorderableBoard extends StatefulWidget {
+  const _ReorderableBoard({required this.repo});
+  final NotesRepository repo;
+
+  @override
+  State<_ReorderableBoard> createState() => _ReorderableBoardState();
+}
+
+class _ReorderableBoardState extends State<_ReorderableBoard> {
+  /// The note currently being dragged, or null.
+  String? _draggedId;
+
+  /// The visual index where the dragged note should appear.
+  int? _hoverIndex;
+
+  /// Build order: the list with the dragged note moved to the hover position.
+  List<Note> _displayOrder(List<Note> notes) {
+    if (_draggedId == null || _hoverIndex == null) return notes;
+    final list = notes.toList();
+    final fromIdx = list.indexWhere((n) => n.id == _draggedId);
+    if (fromIdx < 0) return notes;
+    final note = list.removeAt(fromIdx);
+    final insertIdx = _hoverIndex!.clamp(0, list.length);
+    list.insert(insertIdx, note);
+    return list;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final notes = widget.repo.notes;
+    final displayed = _displayOrder(notes);
+    return Padding(
+      padding: const EdgeInsets.all(8),
+      child: MasonryGridView.count(
+        key: ValueKey(displayed.map((n) => n.id).join(',')),
+        physics: const AlwaysScrollableScrollPhysics(),
+        crossAxisCount: BoardScreen._columnsFor(context),
+        mainAxisSpacing: 8,
+        crossAxisSpacing: 8,
+        itemCount: displayed.length,
+        itemBuilder: (context, i) {
+          final note = displayed[i];
+          final isDragged = note.id == _draggedId;
+          return _DraggableSticky(
+            key: ValueKey(note.id),
+            note: note,
+            repo: widget.repo,
+            isDragged: isDragged,
+            onDragStarted: () {
+              setState(() {
+                _draggedId = note.id;
+                _hoverIndex = i;
+              });
+            },
+            onDragEnd: () {
+              if (_draggedId != null && _hoverIndex != null) {
+                final originalIdx =
+                    notes.indexWhere((n) => n.id == _draggedId);
+                if (originalIdx >= 0 && originalIdx != _hoverIndex) {
+                  widget.repo.reorderToIndex(_draggedId!, _hoverIndex!);
+                }
+              }
+              setState(() {
+                _draggedId = null;
+                _hoverIndex = null;
+              });
+            },
+            onHover: () {
+              if (_draggedId != null && _draggedId != note.id) {
+                final targetIdx =
+                    displayed.indexWhere((n) => n.id == note.id);
+                if (targetIdx >= 0 && targetIdx != _hoverIndex) {
+                  setState(() => _hoverIndex = targetIdx);
+                }
+              }
+            },
+          );
+        },
+      ),
+    );
   }
 }
 
@@ -154,46 +221,51 @@ class _DraggableSticky extends StatelessWidget {
     super.key,
     required this.note,
     required this.repo,
+    required this.isDragged,
+    required this.onDragStarted,
+    required this.onDragEnd,
+    required this.onHover,
   });
 
   final Note note;
   final NotesRepository repo;
+  final bool isDragged;
+  final VoidCallback onDragStarted;
+  final VoidCallback onDragEnd;
+  final VoidCallback onHover;
 
   @override
   Widget build(BuildContext context) {
     final card = _StickyCard(note: note, repo: repo);
     return DragTarget<String>(
       onWillAcceptWithDetails: (d) => d.data != note.id,
-      onAcceptWithDetails: (d) => repo.reorder(d.data, note.id),
+      onAcceptWithDetails: (_) {},
+      onMove: (_) => onHover(),
       builder: (context, candidate, _) {
-        final highlighted = candidate.isNotEmpty;
-        return Container(
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(
-              color: highlighted
-                  ? Theme.of(context).colorScheme.primary
-                  : Colors.transparent,
-              width: 2,
-            ),
-          ),
-          // LayoutBuilder so the drag feedback matches the card's actual
-          // rendered width — otherwise it snaps to a default size mid-drag.
+        return AnimatedOpacity(
+          opacity: isDragged ? 0.3 : 1.0,
+          duration: const Duration(milliseconds: 200),
           child: LayoutBuilder(
             builder: (context, constraints) {
               return LongPressDraggable<String>(
                 data: note.id,
+                onDragStarted: onDragStarted,
+                onDragEnd: (_) => onDragEnd(),
+                onDraggableCanceled: (_, __) => onDragEnd(),
                 feedback: Material(
                   color: Colors.transparent,
                   child: Opacity(
                     opacity: 0.9,
                     child: SizedBox(
                       width: constraints.maxWidth,
-                      child: card,
+                      child: Transform.scale(
+                        scale: 1.05,
+                        child: card,
+                      ),
                     ),
                   ),
                 ),
-                childWhenDragging: Opacity(opacity: 0.3, child: card),
+                childWhenDragging: const SizedBox.shrink(),
                 child: card,
               );
             },
