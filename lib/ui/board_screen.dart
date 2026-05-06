@@ -55,6 +55,10 @@ class BoardScreen extends StatelessWidget {
                 : Padding(
                     padding: const EdgeInsets.all(8),
                     child: MasonryGridView.count(
+                      // Force a full relayout when note order changes.
+                      // MasonryGridView caches column heights by item key,
+                      // which causes gaps when items swap positions.
+                      key: ValueKey(notes.map((n) => n.id).join(',')),
                       physics: const AlwaysScrollableScrollPhysics(),
                       crossAxisCount: _columnsFor(context),
                       mainAxisSpacing: 8,
@@ -163,8 +167,7 @@ class _DraggableSticky extends StatelessWidget {
       onAcceptWithDetails: (d) => repo.reorder(d.data, note.id),
       builder: (context, candidate, _) {
         final highlighted = candidate.isNotEmpty;
-        return AnimatedContainer(
-          duration: const Duration(milliseconds: 120),
+        return Container(
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(10),
             border: Border.all(
