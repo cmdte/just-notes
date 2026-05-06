@@ -116,7 +116,7 @@ class _ReorderableBoardState extends State<_ReorderableBoard> {
     return Padding(
       padding: const EdgeInsets.all(8),
       child: MasonryGridView.count(
-        key: ValueKey(displayed.map((n) => n.id).join(',')),
+        key: ValueKey('${displayed.map((n) => n.id).join(',')}_$_draggedId'),
         physics: const AlwaysScrollableScrollPhysics(),
         crossAxisCount: BoardScreen._columnsFor(context),
         mainAxisSpacing: 8,
@@ -126,7 +126,7 @@ class _ReorderableBoardState extends State<_ReorderableBoard> {
           final note = displayed[i];
           final isDragged = note.id == _draggedId;
           return _DraggableSticky(
-            key: ValueKey(note.id),
+            key: ValueKey('${note.id}_$isDragged'),
             note: note,
             repo: widget.repo,
             isDragged: isDragged,
@@ -240,7 +240,24 @@ class _DraggableSticky extends StatelessWidget {
     return DragTarget<String>(
       onWillAcceptWithDetails: (d) => d.data != note.id,
       onAcceptWithDetails: (_) {},
-      onMove: (_) => onHover(),
+      onMove: (details) {
+        final box = context.findRenderObject() as RenderBox?;
+        if (box == null) return;
+        
+        // This is the top-left of the dragged widget
+        final globalOffset = details.offset;
+        final w = box.size.width;
+        final h = box.size.height;
+        
+        // Center of the dragged widget conservatively (assuming it's roughly same size as target)
+        final centerOffset = box.globalToLocal(globalOffset + Offset(w/2, h/2));
+        
+        // We only trigger reorder if the dragged card's center has entered the central 50% area of the target
+        if (centerOffset.dx > w * 0.25 && centerOffset.dx < w * 0.75 &&
+            centerOffset.dy > h * 0.25 && centerOffset.dy < h * 0.75) {
+          onHover();
+        }
+      },
       builder: (context, candidate, _) {
         return AnimatedOpacity(
           opacity: isDragged ? 0.3 : 1.0,
@@ -252,6 +269,7 @@ class _DraggableSticky extends StatelessWidget {
                 onDragStarted: onDragStarted,
                 onDragEnd: (_) => onDragEnd(),
                 onDraggableCanceled: (_, __) => onDragEnd(),
+                onDragCompleted: onDragEnd,
                 feedback: Material(
                   color: Colors.transparent,
                   child: Opacity(
