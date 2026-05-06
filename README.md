@@ -8,7 +8,7 @@ A small, Google Keep–style note-taking app written in Dart/Flutter.
 - **End-to-end encryption** — every note is encrypted on-device with **AES-256-GCM**. The key is derived from your passphrase via **Argon2id** (19 MiB memory, 2 iterations, parallelism 1, 32-byte output — OWASP "interactive" baseline). The salt and a small verifier blob live in the platform secure storage (Android Keystore via `flutter_secure_storage`).
 - **Pluggable cloud sync** — all sync goes through the [`SyncBackend`](lib/sync/sync_backend.dart) interface. Built-in backends: **Google Drive** (`appDataFolder`), **WebDAV** (Nextcloud/ownCloud/etc.), and **Local folder** (point Syncthing/Dropbox/iCloud Drive at it). Backends only ever see ciphertext (zero-knowledge).
 - **Cross-device key adoption** — first device publishes a `__vault__` descriptor (salt + verifier) to the chosen backend; second device adopts it on unlock so both derive the same key from the shared passphrase.
-- **Tombstones** — deletions propagate across devices via a `__tombstones__` blob (90-day TTL).
+- **Tombstones** — deletions propagate across devices via a `__tombstones__` blob (7-day TTL).
 - **Change passphrase** — Settings → Change passphrase re-encrypts the entire vault and atomically swaps the descriptor.
 - **Offline-first** — local plain-JSON cache (the cloud copy is the encrypted source of truth); auto-sync 800 ms after every edit; pull-to-refresh on the board.
 
@@ -59,6 +59,8 @@ Implement [`SyncBackend`](lib/sync/sync_backend.dart):
 
 ```dart
 abstract class SyncBackend {
+  Future<Map<String, String>> pullManifest();
+  Future<Map<String, dynamic>?> pullOne(String id);
   Future<Map<String, Map<String, dynamic>>> pullAll();
   Future<void> push(String id, Map<String, dynamic> envelope);
   Future<void> delete(String id);
