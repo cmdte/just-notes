@@ -73,7 +73,7 @@ Future<SyncBackend?> buildBackend(BackendConfig cfg, {bool silent = false}) asyn
 
 
 /// File-backed stub that mimics a cloud bucket on disk.
-/// Replace with a real client (Firestore, Supabase, S3, ...) when ready.
+/// Useful for testing or retaining a purely local backend.
 class LocalStubBackend implements SyncBackend {
   LocalStubBackend._(this._file);
 

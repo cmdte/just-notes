@@ -86,7 +86,7 @@ class _NoteEditorScreenState extends State<NoteEditorScreen> {
       onPopInvokedWithResult: (didPop, _) async {
         if (didPop) return;
         await _save();
-        if (mounted) Navigator.of(context).pop();
+        if (context.mounted) Navigator.of(context).pop();
       },
       child: Scaffold(
         backgroundColor: bg,
