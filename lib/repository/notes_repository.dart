@@ -308,6 +308,12 @@ class NotesRepository extends ChangeNotifier {
     } else {
       _backend = newBackend;
       _cfg = cfg;
+      
+      // When disconnecting a backend (switching to Local folder backend or null),
+      // we must mark everything dirty so it saves to the new location instead
+      // of getting dropped.
+      _dirty.addAll(_notes.keys);
+      await _writeDirty();
     }
 
     notifyListeners();
