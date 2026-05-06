@@ -1,8 +1,11 @@
 import 'dart:convert';
 
 import 'package:extension_google_sign_in_as_googleapis_auth/extension_google_sign_in_as_googleapis_auth.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:googleapis/drive/v3.dart' as drive;
+import 'package:googleapis_auth/googleapis_auth.dart' as gapis;
+import 'package:http/http.dart' as http;
 
 import 'sync_backend.dart';
 
@@ -21,9 +24,11 @@ import 'sync_backend.dart';
 class GoogleDriveBackend implements SyncBackend {
   GoogleDriveBackend._(this._driveApi);
 
-  final drive.DriveApi _driveApi;
+  drive.DriveApi _driveApi;
 
   static const _scopes = <String>[drive.DriveApi.driveAppdataScope];
+  static const _storage = FlutterSecureStorage();
+  static const _tokenKey = 'google_drive_access_token';
 
   /// Web OAuth client ID from Google Cloud (Application type: "Web
   /// application"). Required by `google_sign_in` 7.x on Android even though
@@ -40,15 +45,69 @@ class GoogleDriveBackend implements SyncBackend {
     _initialized = true;
   }
 
+  /// Build a DriveApi client from a raw access token string.
+  static GoogleDriveBackend _fromToken(String token) {
+    final creds = gapis.AccessCredentials(
+      gapis.AccessToken(
+        'Bearer',
+        token,
+        DateTime.now().toUtc().add(const Duration(days: 365)),
+      ),
+      null,
+      _scopes,
+    );
+    final client = gapis.authenticatedClient(http.Client(), creds);
+    return GoogleDriveBackend._(drive.DriveApi(client));
+  }
+
+  /// Try to restore a backend from a cached access token (no UI).
+  /// Returns null if no cached token or the token is invalid.
+  static Future<GoogleDriveBackend?> _tryFromCache() async {
+    final token = await _storage.read(key: _tokenKey);
+    if (token == null) return null;
+    final backend = _fromToken(token);
+    try {
+      // Quick probe to verify the token is still valid.
+      await backend._driveApi.files.list(
+        spaces: 'appDataFolder',
+        pageSize: 1,
+        $fields: 'files(id)',
+      );
+      return backend;
+    } catch (_) {
+      await _storage.delete(key: _tokenKey);
+      return null;
+    }
+  }
+
   /// Sign in (interactive if needed) and return a connected backend.
   /// Returns null if the user cancels or sign-in fails.
-  static Future<GoogleDriveBackend?> connect() async {
+  ///
+  /// When [silent] is true, tries the cached token first, then lightweight
+  /// auth. Returns null instead of showing a login popup.
+  ///
+  /// When [interactive] is true, skips the cached token and lightweight
+  /// auth, going straight to the full account picker.
+  static Future<GoogleDriveBackend?> connect({
+    bool silent = false,
+    bool interactive = false,
+  }) async {
+    // 1. Try cached token — no Google Sign-In SDK involved.
+    if (!interactive) {
+      final cached = await _tryFromCache();
+      if (cached != null) return cached;
+    }
+
+    // 2. Fall through to Google Sign-In.
     await _ensureInit();
     final signIn = GoogleSignIn.instance;
 
-    GoogleSignInAccount? account =
-        await signIn.attemptLightweightAuthentication();
+    GoogleSignInAccount? account;
+    if (!interactive) {
+      account = await signIn.attemptLightweightAuthentication();
+    }
     if (account == null) {
+      if (silent) return null;
       try {
         account = await signIn.authenticate();
       } on GoogleSignInException {
@@ -59,22 +118,43 @@ class GoogleDriveBackend implements SyncBackend {
     final authClient = account.authorizationClient;
     GoogleSignInClientAuthorization? authorization =
         await authClient.authorizationForScopes(_scopes);
-    authorization ??= await authClient.authorizeScopes(_scopes);
+    if (authorization == null) {
+      if (silent) return null;
+      authorization = await authClient.authorizeScopes(_scopes);
+    }
+
+    // Cache the token for future launches.
+    final token = authorization.accessToken;
+    await _storage.write(key: _tokenKey, value: token);
 
     final client = authorization.authClient(scopes: _scopes);
     return GoogleDriveBackend._(drive.DriveApi(client));
   }
 
   static Future<void> signOut() async {
+    await _storage.delete(key: _tokenKey);
     await _ensureInit();
     await GoogleSignIn.instance.signOut();
   }
 
-  static Future<String?> currentEmail() async {
+  /// Re-authenticate via Google Sign-In and update the cached token.
+  /// Called when the cached token turns out to be expired mid-session.
+  Future<bool> _refreshToken() async {
     await _ensureInit();
-    final account =
-        await GoogleSignIn.instance.attemptLightweightAuthentication();
-    return account?.email;
+    final signIn = GoogleSignIn.instance;
+
+    final account = await signIn.attemptLightweightAuthentication();
+    if (account == null) return false;
+
+    final authClient = account.authorizationClient;
+    final authorization = await authClient.authorizationForScopes(_scopes);
+    if (authorization == null) return false;
+
+    final token = authorization.accessToken;
+    await _storage.write(key: _tokenKey, value: token);
+    final client = authorization.authClient(scopes: _scopes);
+    _driveApi = drive.DriveApi(client);
+    return true;
   }
 
   // --- index ---------------------------------------------------------------
@@ -118,6 +198,17 @@ class GoogleDriveBackend implements SyncBackend {
 
   @override
   Future<Map<String, String>> pullManifest() async {
+    try {
+      return await _pullManifestInner();
+    } on drive.DetailedApiRequestError catch (e) {
+      if (e.status == 401 && await _refreshToken()) {
+        return _pullManifestInner();
+      }
+      rethrow;
+    }
+  }
+
+  Future<Map<String, String>> _pullManifestInner() async {
     final index = await _listIndex();
     return index.map((id, f) => MapEntry(
           id,

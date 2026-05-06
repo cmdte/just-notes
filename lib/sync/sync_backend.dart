@@ -48,12 +48,12 @@ abstract class SyncBackend {
 /// configured backend can't be instantiated (e.g. the user has not signed
 /// in to Drive yet, or WebDAV creds are missing) — callers should fall
 /// back to the local stub.
-Future<SyncBackend?> buildBackend(BackendConfig cfg) async {
+Future<SyncBackend?> buildBackend(BackendConfig cfg, {bool silent = false}) async {
   switch (cfg.kind) {
     case BackendKind.stub:
       return LocalStubBackend.create();
     case BackendKind.googleDrive:
-      return GoogleDriveBackend.connect();
+      return GoogleDriveBackend.connect(silent: silent);
     case BackendKind.webdav:
       if (cfg.webdavUrl == null ||
           cfg.webdavUser == null ||

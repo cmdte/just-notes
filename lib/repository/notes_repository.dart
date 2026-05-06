@@ -137,31 +137,30 @@ class NotesRepository extends ChangeNotifier {
     final cfgRaw = await _storage.read(key: _backendCfgKey);
     final cfg = BackendConfig.fromJsonString(cfgRaw);
 
-    // Try to connect to the configured backend up-front so we can adopt
-    // the vault descriptor (salt + wrapped DEK) published by another
-    // device. If the backend is unavailable (offline, sign-in cancelled),
-    // fall back to the local stub and use whatever descriptor we already
-    // have on disk.
+    // Try to use the locally cached vault descriptor first. Only reach
+    // out to the cloud backend if there is no local descriptor (i.e.
+    // first-time setup on a new device that needs to adopt the vault from
+    // another device). This avoids touching GoogleSignIn on every app
+    // launch.
     SyncBackend? backend;
     VaultDescriptor? descriptor;
     var backendReachable = false;
-    if (cfg.kind != BackendKind.stub) {
-      backend = await buildBackend(cfg);
+
+    final localRaw = await _storage.read(key: _descriptorStorageKey);
+    if (localRaw != null) {
+      descriptor = VaultDescriptor.fromJson(
+        jsonDecode(localRaw) as Map<String, dynamic>,
+      );
+    }
+
+    if (descriptor == null && cfg.kind != BackendKind.stub) {
+      backend = await buildBackend(cfg, silent: true);
       if (backend != null) {
         try {
           descriptor =
               VaultDescriptor.fromJson(await backend.pullOne(_vaultDescriptorId));
           backendReachable = true;
         } catch (_) {/* offline tolerated */}
-      }
-    }
-
-    if (descriptor == null) {
-      final localRaw = await _storage.read(key: _descriptorStorageKey);
-      if (localRaw != null) {
-        descriptor = VaultDescriptor.fromJson(
-          jsonDecode(localRaw) as Map<String, dynamic>,
-        );
       }
     }
 
@@ -194,7 +193,7 @@ class NotesRepository extends ChangeNotifier {
       await _storage.delete(key: _rememberedPassKey);
     }
 
-    backend ??= await buildBackend(cfg) ?? await LocalStubBackend.create();
+    backend ??= await buildBackend(cfg, silent: true) ?? await LocalStubBackend.create();
 
     // Publish the descriptor if this device just minted one.
     if (cfg.kind != BackendKind.stub && freshlyCreated && backendReachable) {
@@ -228,15 +227,6 @@ class NotesRepository extends ChangeNotifier {
     await repo._loadRemoteTags();
     await repo._loadDirty();
 
-    // If the backend was reachable, run a delta sync now so the user sees
-    // other devices' notes immediately on first frame (and so notes
-    // deleted on other devices vanish before the UI ever renders them).
-    // If unreachable or stub-only, skip — UI shows the local cache.
-    if (backendReachable) {
-      await repo.sync();
-    } else {
-      unawaited(repo.sync());
-    }
     return (repo: repo, error: null);
   }
 

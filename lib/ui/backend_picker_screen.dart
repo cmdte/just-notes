@@ -82,7 +82,10 @@ class _BackendPickerScreenState extends State<BackendPickerScreen> {
       _error = null;
     });
     try {
-      final backend = await GoogleDriveBackend.connect();
+      // Sign out first so the user gets the account picker when
+      // (re-)selecting Google Drive.
+      await GoogleDriveBackend.signOut();
+      final backend = await GoogleDriveBackend.connect(interactive: true);
       if (backend == null) {
         setState(() {
           _busy = false;

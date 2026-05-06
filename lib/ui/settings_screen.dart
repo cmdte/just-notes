@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 
 import '../repository/notes_repository.dart';
 import '../settings/app_settings.dart';
+import '../sync/backend_config.dart';
+import '../sync/google_drive_backend.dart';
 import 'backend_picker_screen.dart';
 import 'unlock_screen.dart';
 
@@ -61,6 +63,15 @@ class SettingsScreen extends StatelessWidget {
                   style: TextStyle(fontSize: 12, color: Colors.grey),
                 ),
               ),
+              if (repo.backendConfig.kind != BackendKind.stub)
+                ListTile(
+                  leading: const Icon(Icons.logout),
+                  title: const Text('Disconnect sync'),
+                  subtitle: const Text(
+                    'Removes cloud credentials. Notes stay on device.',
+                  ),
+                  onTap: () => _disconnectBackend(context),
+                ),
               const Divider(height: 1),
               const _SectionHeader('Security'),
               ListTile(
@@ -198,6 +209,38 @@ class SettingsScreen extends StatelessWidget {
         content: Text(error ?? 'Passphrase changed.'),
         backgroundColor: error == null ? null : Colors.red,
       ),
+    );
+  }
+
+  Future<void> _disconnectBackend(BuildContext context) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Disconnect sync?'),
+        content: const Text(
+          'Cloud credentials will be removed. '
+          'Your notes stay encrypted on this device.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton.tonal(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Disconnect'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !context.mounted) return;
+    if (repo.backendConfig.kind == BackendKind.googleDrive) {
+      await GoogleDriveBackend.signOut();
+    }
+    await repo.setBackend(const BackendConfig(kind: BackendKind.stub));
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Sync disconnected.')),
     );
   }
 }
