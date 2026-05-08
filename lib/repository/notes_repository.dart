@@ -236,7 +236,16 @@ class NotesRepository extends ChangeNotifier {
   /// If the new backend already holds a vault descriptor (because another
   /// device pushed it), adopt that descriptor: unwrap its DEK with the
   /// remembered passphrase so notes on the new backend become readable.
-  Future<({bool ok, String? error})> setBackend(BackendConfig cfg) async {
+  Future<({bool ok, String? error})> setBackend(
+    BackendConfig cfg, {
+    bool wipeCurrent = false,
+  }) async {
+    if (wipeCurrent && _backend is! LocalStubBackend) {
+      try {
+        await _backend.deleteAll();
+      } catch (e) {/* best effort */}
+    }
+
     await _storage.write(key: _backendCfgKey, value: cfg.toJsonString());
     final newBackend = await buildBackend(cfg);
     if (newBackend == null) {

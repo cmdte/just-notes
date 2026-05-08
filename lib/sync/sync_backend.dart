@@ -42,6 +42,14 @@ abstract class SyncBackend {
 
   /// Remove a note by id.
   Future<void> delete(String id);
+
+  /// Remove all notes and vault state from this backend.
+  Future<void> deleteAll() async {
+    final manifest = await pullManifest();
+    for (final id in manifest.keys) {
+      await delete(id);
+    }
+  }
 }
 
 /// Builds a backend from a saved [BackendConfig]. Returns `null` if the
